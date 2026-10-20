@@ -141,7 +141,9 @@ runs:
         curl -fsSL --retry 3 -o "$dir/cosign.exe" \
           https://github.com/sigstore/cosign/releases/download/v2.6.0/cosign-windows-amd64.exe
         want=7beb4dd1e19a72c328bbf7c0d7342d744edbf5cbb082f227b2b76e04a21c16ef
-        got=$(sha256sum "$dir/cosign.exe" | cut -d' ' -f1)
+        # Hash a relative name: given a path with backslashes, Git Bash's
+        # sha256sum escapes the line and prefixes the hash with "\".
+        got=$(cd "$dir" && sha256sum cosign.exe | cut -d' ' -f1)
         [ "$got" = "$want" ] || { echo "::error::sha256 mismatch for cosign: got $got, want $want"; exit 1; }
         echo "$dir" >> "$GITHUB_PATH"
 
