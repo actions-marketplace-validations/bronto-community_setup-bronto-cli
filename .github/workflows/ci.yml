@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # The action downloads whatever bronto-cli has released; catch a release
+  # that breaks it (renamed assets, a signing change) without waiting for a
+  # change here.
+  schedule:
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Run the action from this checkout on every runner OS/arch it supports and
+  # check that the bronto CLI it installed runs and reports the right version.
+  test:
+    name: ${{ matrix.runner }} (${{ matrix.version }}${{ matrix.verify == 'false' && ', no signature' || '' }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest, windows-11-arm]
+        version: [latest, 0.8.1]
+        verify: ["true"]
+        include:
+          # The unsigned path, once is enough.
+          - runner: ubuntu-latest
+            version: 0.8.1
+            verify: "false"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run the action
+        id: setup
+        uses: ./
+        with:
+          version: ${{ matrix.version }}
+          verify-signature: ${{ matrix.verify }}
+          api-key: test-key-not-real
+          region: eu
+
+      - name: Check the installed CLI
+        shell: bash
+        env:
+          WANT: ${{ matrix.version }}
+          GOT_OUTPUT: ${{ steps.setup.outputs.version }}
+          GOT_PATH: ${{ steps.setup.outputs.path }}
+        run: |
+          set -euo pipefail
+          # `bronto version` prints JSON when stdout is not a terminal.
+          reported=$(bronto version | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')
+          echo "bronto version: $reported, action output: $GOT_OUTPUT, path: $GOT_PATH"
+          [ "$reported" = "$GOT_OUTPUT" ] || { echo "::error::bronto reports $reported, action output says $GOT_OUTPUT"; exit 1; }
+          if [ "$WANT" != latest ] && [ "$reported" != "$WANT" ]; then
+            echo "::error::asked for $WANT, got $reported"; exit 1
+          fi
+          [ -d "$GOT_PATH" ] || { echo "::error::path output $GOT_PATH is not a directory"; exit 1; }
+          [ "${BRONTO_API_KEY:-}" = test-key-not-real ] || { echo "::error::BRONTO_API_KEY was not exported"; exit 1; }
+          [ "${BRONTO_REGION:-}" = eu ] || { echo "::error::BRONTO_REGION was not exported"; exit 1; }
+
+  # A version that doesn't exist must fail the action, not silently pass.
+  bad-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run the action with a missing version
+        id: setup
+        continue-on-error: true
+        uses: ./
+        with:
+          version: 0.0.999
+      - name: Expect failure
+        if: steps.setup.outcome != 'failure'
+        run: |
+          echo "::error::the action did not fail for a missing version"
+          exit 1

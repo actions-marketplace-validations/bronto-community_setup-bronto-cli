@@ -1,0 +1,193 @@
+name: Setup bronto CLI
+description: Install and verify the bronto CLI, the community command-line client for the Bronto observability platform.
+author: bronto-community
+branding:
+  icon: terminal
+  color: green
+
+inputs:
+  version:
+    description: Version of the bronto CLI to install, such as `0.8.1` or `v0.8.1`, or `latest`.
+    required: false
+    default: latest
+  verify-signature:
+    description: >-
+      Verify the cosign signature on the release's checksums.txt, in addition
+      to the sha256 check that always runs. Set to `false` to skip it (and the
+      cosign download).
+    required: false
+    default: "true"
+  api-key:
+    description: >-
+      Optional Bronto API key. If set, it is masked in logs and exported as
+      BRONTO_API_KEY for later steps.
+    required: false
+    default: ""
+  region:
+    description: Optional Bronto region (for example `eu` or `us`), exported as BRONTO_REGION for later steps.
+    required: false
+    default: ""
+  github-token:
+    description: Token used to look up the latest release, to avoid unauthenticated API rate limits.
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  version:
+    description: The installed version, without a leading `v`.
+    value: ${{ steps.resolve.outputs.version }}
+  path:
+    description: Directory containing the bronto executable (added to PATH).
+    value: ${{ steps.install.outputs.path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve version and platform
+      id: resolve
+      shell: bash
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+        case "$RUNNER_OS" in
+          Linux) os=linux ext=tar.gz ;;
+          macOS) os=darwin ext=tar.gz ;;
+          Windows) os=windows ext=zip ;;
+          *) echo "::error::Unsupported runner OS: $RUNNER_OS"; exit 1 ;;
+        esac
+        case "$RUNNER_ARCH" in
+          X64) arch=amd64 ;;
+          ARM64) arch=arm64 ;;
+          *) echo "::error::Unsupported runner architecture: $RUNNER_ARCH"; exit 1 ;;
+        esac
+
+        version="${INPUT_VERSION#v}"
+        if [ -z "$version" ] || [ "$version" = latest ]; then
+          auth=()
+          [ -n "$GH_TOKEN" ] && auth=(-H "Authorization: Bearer $GH_TOKEN")
+          tag=$(curl -fsSL ${auth[@]+"${auth[@]}"} -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/bronto-community/bronto-cli/releases/latest \
+            | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
+          [ -n "$tag" ] || { echo "::error::Could not look up the latest bronto CLI release"; exit 1; }
+          version="${tag#v}"
+        fi
+        if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
+          echo "::error::Invalid version: $INPUT_VERSION"; exit 1
+        fi
+
+        {
+          echo "version=$version"
+          echo "asset=bronto_${version}_${os}_${arch}.${ext}"
+          echo "ext=$ext"
+          echo "arch=$arch"
+        } >> "$GITHUB_OUTPUT"
+        echo "Installing the bronto CLI $version for $os/$arch"
+
+    - name: Download and check the archive
+      id: download
+      shell: bash
+      env:
+        VERSION: ${{ steps.resolve.outputs.version }}
+        ASSET: ${{ steps.resolve.outputs.asset }}
+        VERIFY: ${{ inputs.verify-signature }}
+      run: |
+        set -euo pipefail
+        dir="$RUNNER_TEMP/setup-bronto-cli-$VERSION"
+        mkdir -p "$dir"
+        cd "$dir"
+        base="https://github.com/bronto-community/bronto-cli/releases/download/v$VERSION"
+        files=("$ASSET" checksums.txt)
+        [ "$VERIFY" = true ] && files+=(checksums.txt.sig checksums.txt.pem)
+        for f in "${files[@]}"; do
+          curl -fsSL --retry 3 -o "$f" "$base/$f" || {
+            echo "::error::Could not download $f for v$VERSION. Does the release exist?"
+            [ "$f" = checksums.txt.sig ] && echo "::error::Releases v0.1.1 and earlier are unsigned; set verify-signature: false for them."
+            exit 1
+          }
+        done
+
+        want=$(awk -v f="$ASSET" '$2 == f { print $1 }' checksums.txt)
+        [ -n "$want" ] || { echo "::error::$ASSET is not listed in checksums.txt"; exit 1; }
+        if command -v sha256sum >/dev/null; then
+          got=$(sha256sum "$ASSET" | cut -d' ' -f1)
+        else
+          got=$(shasum -a 256 "$ASSET" | cut -d' ' -f1)
+        fi
+        [ "$got" = "$want" ] || { echo "::error::sha256 mismatch for $ASSET: got $got, want $want"; exit 1; }
+        echo "sha256 OK: $ASSET"
+        echo "dir=$dir" >> "$GITHUB_OUTPUT"
+
+    # Same cosign as the release workflow that signs: v2.x writes and reads the
+    # detached .sig/.pem pair. Moving releases to v3 bundles means updating
+    # this action too.
+    - name: Install cosign
+      if: inputs.verify-signature == 'true'
+      uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      with:
+        cosign-release: "v2.6.0"
+
+    - name: Verify the checksums signature
+      if: inputs.verify-signature == 'true'
+      shell: bash
+      working-directory: ${{ steps.download.outputs.dir }}
+      env:
+        VERSION: ${{ steps.resolve.outputs.version }}
+      run: |
+        set -euo pipefail
+        # The certificate must come from bronto-cli's release workflow, run
+        # for exactly this tag.
+        cosign verify-blob \
+          --certificate checksums.txt.pem \
+          --signature checksums.txt.sig \
+          --certificate-identity "https://github.com/bronto-community/bronto-cli/.github/workflows/release.yml@refs/tags/v$VERSION" \
+          --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+          checksums.txt
+
+    - name: Install
+      id: install
+      shell: bash
+      env:
+        VERSION: ${{ steps.resolve.outputs.version }}
+        ASSET: ${{ steps.resolve.outputs.asset }}
+        EXT: ${{ steps.resolve.outputs.ext }}
+        ARCH: ${{ steps.resolve.outputs.arch }}
+        DIR: ${{ steps.download.outputs.dir }}
+      run: |
+        set -euo pipefail
+        dest="$RUNNER_TOOL_CACHE/bronto-cli/$VERSION/$ARCH"
+        rm -rf "$dest"
+        mkdir -p "$dest"
+        if [ "$EXT" = zip ]; then
+          unzip -q "$DIR/$ASSET" -d "$dest"
+        else
+          tar -xzf "$DIR/$ASSET" -C "$dest"
+        fi
+        exe=bronto
+        [ "$RUNNER_OS" = Windows ] && exe=bronto.exe
+        [ -f "$dest/$exe" ] || { echo "::error::$exe not found in $ASSET"; exit 1; }
+        chmod +x "$dest/$exe" 2>/dev/null || true
+        echo "$dest" >> "$GITHUB_PATH"
+        echo "path=$dest" >> "$GITHUB_OUTPUT"
+        "$dest/$exe" version
+
+    - name: Export credentials
+      if: inputs.api-key != '' || inputs.region != ''
+      shell: bash
+      env:
+        API_KEY: ${{ inputs.api-key }}
+        REGION: ${{ inputs.region }}
+      run: |
+        set -euo pipefail
+        # A newline would let the value inject extra variables into GITHUB_ENV.
+        case "$API_KEY$REGION" in
+          *$'\n'*|*$'\r'*) echo "::error::api-key and region must be single-line values"; exit 1 ;;
+        esac
+        if [ -n "$API_KEY" ]; then
+          echo "::add-mask::$API_KEY"
+          echo "BRONTO_API_KEY=$API_KEY" >> "$GITHUB_ENV"
+        fi
+        if [ -n "$REGION" ]; then
+          echo "BRONTO_REGION=$REGION" >> "$GITHUB_ENV"
+        fi
