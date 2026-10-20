@@ -123,10 +123,27 @@ runs:
     # detached .sig/.pem pair. Moving releases to v3 bundles means updating
     # this action too.
     - name: Install cosign
-      if: inputs.verify-signature == 'true'
+      if: inputs.verify-signature == 'true' && !(runner.os == 'Windows' && runner.arch == 'ARM64')
       uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       with:
         cosign-release: "v2.6.0"
+
+    # cosign v2.6.0 has no Windows arm64 build and cosign-installer refuses to
+    # run there. Windows 11 on ARM runs x64 binaries under emulation, so fetch
+    # the official amd64 build, pinned to the sha256 from cosign_checksums.txt.
+    - name: Install cosign (Windows arm64, x64 emulation)
+      if: inputs.verify-signature == 'true' && runner.os == 'Windows' && runner.arch == 'ARM64'
+      shell: bash
+      run: |
+        set -euo pipefail
+        dir="$RUNNER_TEMP/cosign-v2.6.0"
+        mkdir -p "$dir"
+        curl -fsSL --retry 3 -o "$dir/cosign.exe" \
+          https://github.com/sigstore/cosign/releases/download/v2.6.0/cosign-windows-amd64.exe
+        want=7beb4dd1e19a72c328bbf7c0d7342d744edbf5cbb082f227b2b76e04a21c16ef
+        got=$(sha256sum "$dir/cosign.exe" | cut -d' ' -f1)
+        [ "$got" = "$want" ] || { echo "::error::sha256 mismatch for cosign: got $got, want $want"; exit 1; }
+        echo "$dir" >> "$GITHUB_PATH"
 
     - name: Verify the checksums signature
       if: inputs.verify-signature == 'true'
